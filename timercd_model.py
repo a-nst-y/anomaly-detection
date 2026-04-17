@@ -1,4 +1,24 @@
 """
+timercd_model.py
+================
+Самостоятельная реализация Time-RCD (Relative Context Discrepancy)
+для детектирования аномалий в многомерных временных рядах.
+
+Статья: https://arxiv.org/abs/2509.21190
+Реализовано с нуля, без зависимости от оригинального репо.
+
+Ключевая идея RCD
+-----------------
+Для каждого запросного окна (query) модель видит контекстное окно (context)
+из той же точки ряда. Аномалия — это когда query сильно отличается от того,
+что модель предсказывает на основе context.
+
+    [--- context window ---][--- query window ---]
+           ↓ encoder               ↓ (маскируется)
+           ↓←←←←←←←← cross-attn ←←←←←←←←←←←←↓
+                      reconstructed query
+                             ↓
+           anomaly_score = |original - reconstructed|
 
 Архитектура
 -----------
@@ -25,9 +45,9 @@ from typing import Optional, Literal
 
 @dataclass
 class RCDOutput:
-    reconstruction: torch.Tensor       
-    anomaly_scores: torch.Tensor        
-    loss: Optional[torch.Tensor] = None  
+    reconstruction: torch.Tensor        # (B, T, C) — реконструированный ряд
+    anomaly_scores: torch.Tensor         # (B, T)    — скор аномалии по каждому timestep
+    loss: Optional[torch.Tensor] = None  # скалярный лосс (только при обучении)
 
 class RevIN(nn.Module):
     """
@@ -86,6 +106,7 @@ class Patchify(nn.Module):
         P = self.patch_len
         S = self.stride
 
+        # Дополняем до кратной длины если нужно
         n_patches = (T - P) // S + 1
         patches = []
         for i in range(n_patches):
@@ -147,7 +168,7 @@ class PatchEmbedding(nn.Module):
         div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div[:d_model // 2])
-        self.register_buffer("pe", pe.unsqueeze(0)) 
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, N, joint_dim) → (B, N, d_model)"""
@@ -170,10 +191,10 @@ class TransformerEncoderBlock(nn.Module):
         self.drop  = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        
+        # Self-attention с residual
         attn_out, _ = self.self_attn(x, x, x, attn_mask=attn_mask)
         x = self.norm1(x + self.drop(attn_out))
-      
+        # FFN с residual
         x = self.norm2(x + self.drop(self.ff(x)))
         return x
 
@@ -253,21 +274,24 @@ def apply_mask_to_patches(
     if mask_ratio <= 0:
         return patches, torch.zeros(B, N, device=device)
 
+# СТАЛО:
     all_masks = []
     for b in range(B):
-        if mask_type == "random":
-            m = random_mask(N, mask_ratio, device)
-        elif mask_type == "block":
-            m = block_mask(N, mask_ratio, device)
-        elif mask_type == "channel_independent":
-            m = random_mask(N, mask_ratio, device)
-        else:
-            raise ValueError(f"Unknown mask_type: {mask_type}")
-        all_masks.append(m)
+      if mask_type == "random":
+        m = random_mask(N, mask_ratio, device)
+      elif mask_type == "block":
+        m = block_mask(N, mask_ratio, device)
+      elif mask_type == "channel_independent":
+        assert n_channels is not None, "n_channels required"
+        channel_mask = torch.rand(N, n_channels, device=device) < mask_ratio
+        m = channel_mask.any(dim=1).float()
+      else:
+        raise ValueError(f"Unknown mask_type: {mask_type}")
+      all_masks.append(m)
 
-    mask = torch.stack(all_masks, dim=0) 
-    masked = patches * (1.0 - mask.unsqueeze(-1))
-    return masked, mask
+    mask = torch.stack(all_masks, dim=0)          # (B, N) ← вот чего не хватало
+    masked_patches = patches * (1.0 - mask.unsqueeze(-1))
+    return masked_patches, mask
 
 class TimeRCD(nn.Module):
     """
@@ -327,6 +351,7 @@ class TimeRCD(nn.Module):
         self.context_ratio = context_ratio
 
         joint_dim  = n_channels * patch_len
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, joint_dim))
 
         # Компоненты
         self.revin   = RevIN(n_channels)
@@ -344,10 +369,9 @@ class TimeRCD(nn.Module):
         self.unpatchify = Unpatchify(patch_len, patch_stride, seq_len, n_channels)
 
     def _encode(self, patches: torch.Tensor) -> torch.Tensor:
-        """patches: (B, N, C*P) → (B, N, d_model)"""
         x = self.embed(patches)
         for block in self.encoder:
-            x = block(x)
+            x = block(x)  # без маски — полный self-attention
         return x
 
     def forward(self, x: torch.Tensor) -> RCDOutput:
@@ -358,16 +382,21 @@ class TimeRCD(nn.Module):
         B, T, C = x.shape
         x_norm, stats = self.revin(x, "norm")
 
+        # Патчинг
         patches = self.patchify(x_norm)          # (B, N, C*P)
 
+        # Энкодинг
         encoded = self._encode(patches)          # (B, N, d_model)
 
+        # Реконструкция
         recon_patches = self.head(encoded)       # (B, N, C*P)
         recon_norm    = self.unpatchify(recon_patches)  # (B, T, C)
 
+        # Денормализация теми же stats что и нормализация
         recon = self.revin(recon_norm, "denorm", stats=stats)
 
-        anomaly_scores = torch.abs(x - recon).max(dim=-1)  # (B, T)
+        # Anomaly score: MAE по каналам, усреднённый в каждый timestep
+        anomaly_scores = torch.abs(x - recon).mean(dim=-1)  # (B, T)
 
         return RCDOutput(reconstruction=recon, anomaly_scores=anomaly_scores)
 
@@ -397,16 +426,25 @@ class TimeRCD(nn.Module):
             loss = F.mse_loss(recon_patches, patches)
             return loss
 
-        masked_patches, mask = apply_mask_to_patches(
-            patches, mask_ratio, mask_type, n_channels=C
-        )                                         # (B, N, C*P), (B, N)
+        # Маскирование
+# СТАЛО — берём только маску из apply_mask_to_patches, патчи строим сами:
+        _, mask = apply_mask_to_patches(
+        patches, mask_ratio, mask_type, n_channels=C
+        )  # нам нужна только маска (B, N)
 
+        mask_token = self.mask_token.expand(B, patches.shape[1], -1)
+        masked_patches = patches * (1.0 - mask.unsqueeze(-1)) + mask_token * mask.unsqueeze(-1)
 
         encoded = self._encode(masked_patches)
         recon_patches = self.head(encoded)        # (B, N, C*P)
 
-        inv_mask = mask.unsqueeze(-1)             # (B, N, 1)
-        loss = ((recon_patches - patches) ** 2 * inv_mask).sum() / (inv_mask.sum() * patches.shape[-1] + 1e-8)
+        inv_mask = mask.unsqueeze(-1)
+        visible_mask = 1.0 - inv_mask
+
+        loss_masked = ((recon_patches - patches) ** 2 * inv_mask).sum() / (inv_mask.sum() * patches.shape[-1] + 1e-8)
+        loss_visible = ((recon_patches - patches) ** 2 * visible_mask).sum() / (visible_mask.sum() * patches.shape[-1] + 1e-8)
+
+        loss = loss_masked + 0.1 * loss_visible
 
         return loss
 
@@ -429,10 +467,9 @@ class TimeRCD(nn.Module):
         patches = self.patchify(x_norm)          # (B, N, C*P)
         N = patches.shape[1]
 
-        n_context = max(1, int(self.context_ratio * N))
-
+        n_context = max(1, int((1.0 - mask_ratio) * N))  # context = (1 - mask_ratio)
         mask = torch.zeros(B, N, device=x.device)
-        mask[:, n_context:] = 1.0
+        mask[:, n_context:] = 1.0 
 
         if mask_ratio > 0:
             extra_mask = torch.zeros(B, N, device=x.device)
@@ -441,11 +478,13 @@ class TimeRCD(nn.Module):
                 extra_mask[b, :n_context] = m
             mask = torch.clamp(mask + extra_mask, 0, 1)
 
-        masked_patches = patches * (1.0 - mask.unsqueeze(-1))
+        mask_token = self.mask_token.expand(B, patches.shape[1], -1)
+        masked_patches = patches * (1.0 - mask.unsqueeze(-1)) + mask_token * mask.unsqueeze(-1)
 
         encoded = self._encode(masked_patches)
         recon_patches = self.head(encoded)
 
+        # Лосс только по query части
         query_mask = torch.zeros_like(mask)
         query_mask[:, n_context:] = 1.0
         inv_mask = query_mask.unsqueeze(-1)
@@ -464,11 +503,13 @@ class TimeRCD(nn.Module):
 
         all_scores = torch.zeros(B, N, device=x.device)
 
+        # Для каждого патча: берём всё до него как context, он — query
         for q_idx in range(1, N):
             # Маска: только q_idx маскируем
             mask = torch.zeros(B, N, device=x.device)
             mask[:, q_idx] = 1.0
-            masked = patches * (1.0 - mask.unsqueeze(-1))
+            mask_token = self.mask_token.expand(B, patches.shape[1], -1)
+            masked = patches * (1.0 - mask.unsqueeze(-1)) + mask_token * mask.unsqueeze(-1)
 
             with torch.no_grad():
                 encoded = self._encode(masked)
@@ -478,8 +519,10 @@ class TimeRCD(nn.Module):
             err = ((recon[:, q_idx, :] - patches[:, q_idx, :]) ** 2).mean(dim=-1)  # (B,)
             all_scores[:, q_idx] = err
 
+        # Первый патч — берём среднюю ошибку по полной реконструкции
         all_scores[:, 0] = all_scores[:, 1:].mean(dim=1)
 
+        # Из патч-скоров → timestep скоры
         score_ts = torch.zeros(B, T, device=x.device)
         count_ts = torch.zeros(B, T, device=x.device)
         for i in range(N):
@@ -489,6 +532,7 @@ class TimeRCD(nn.Module):
             count_ts[:, start:end] += 1
         score_ts = score_ts / (count_ts + 1e-8)
 
+        # Полная реконструкция для метрик
         with torch.no_grad():
             full_out = self.forward(x)
 
@@ -497,6 +541,10 @@ class TimeRCD(nn.Module):
             anomaly_scores=score_ts,
         )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Фабрика с пресетами
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_timercd(
     n_channels: int,
@@ -529,6 +577,10 @@ def build_timercd(
     )
     return model.to(device)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Быстрый smoke-test
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     B, T, C = 4, 512, 5
     x = torch.randn(B, T, C)
