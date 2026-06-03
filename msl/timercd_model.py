@@ -1,41 +1,3 @@
-"""
-timercd_model.py
-================
-Самостоятельная реализация Time-RCD (Relative Context Discrepancy)
-для детектирования аномалий в многомерных временных рядах.
-
-Статья: https://arxiv.org/abs/2509.21190
-Реализовано с нуля, без зависимости от оригинального репо.
-
-Ключевая идея RCD
------------------
-Для каждого запросного окна (query) модель видит контекстное окно (context)
-из той же точки ряда. Аномалия — это когда query сильно отличается от того,
-что модель предсказывает на основе context.
-
-    [--- context window ---][--- query window ---]
-           ↓ encoder               ↓ (маскируется)
-           ↓←←←←←←←← cross-attn ←←←←←←←←←←←←↓
-                      reconstructed query
-                             ↓
-           anomaly_score = |original - reconstructed|
-
-Архитектура
------------
-1. RevIN          — обратимая нормализация по каналам
-2. Patching       — разбивка на патчи, (B, T, C) → (B, N_patches, C*patch_len)
-3. PatchEmbedding — Linear + positional embedding
-4. Masking        — случайное / блочное / независимое по каналам /
-                    канальное / гибридное
-5. Transformer Encoder — стек блоков (self-attn + FFN)
-6. ReconHead      — Linear → обратно в патчи → ряд
-
-Многомерность
--------------
-Каждый патч содержит значения **всех каналов** за один временной отрезок.
-Это joint-embedding: модель видит межканальные зависимости в каждом токене.
-"""
-
 import math
 import torch
 import torch.nn as nn
@@ -46,14 +8,10 @@ from typing import Optional, Literal
 
 @dataclass
 class RCDOutput:
-    reconstruction: torch.Tensor         # (B, T, C) — реконструированный ряд
-    anomaly_scores: torch.Tensor          # (B, T)    — скор аномалии по каждому timestep
-    loss: Optional[torch.Tensor] = None   # скалярный лосс (только при обучении)
+    reconstruction: torch.Tensor        
+    anomaly_scores: torch.Tensor   
+    loss: Optional[torch.Tensor] = None 
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. RevIN — обратимая нормализация
-# ─────────────────────────────────────────────────────────────────────────────
 
 class RevIN(nn.Module):
     """
@@ -76,7 +34,6 @@ class RevIN(nn.Module):
             self.beta  = nn.Parameter(torch.zeros(1, 1, n_channels))
 
     def forward(self, x: torch.Tensor, mode: str = "norm", stats=None):
-        """x: (B, T, C)"""
         if mode == "norm":
             mean = x.mean(dim=1, keepdim=True)
             std  = x.std(dim=1, keepdim=True) + self.eps
@@ -93,11 +50,6 @@ class RevIN(nn.Module):
             return x
         else:
             raise ValueError(f"Unknown mode: {mode}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Patching / Unpatching
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Patchify(nn.Module):
     """
@@ -119,9 +71,9 @@ class Patchify(nn.Module):
         patches = []
         for i in range(n_patches):
             start = i * S
-            patch = x[:, start:start + P, :]           # (B, P, C)
-            patches.append(patch.reshape(B, 1, C * P))  # (B, 1, C*P)
-        return torch.cat(patches, dim=1)                # (B, N, C*P)
+            patch = x[:, start:start + P, :]          
+            patches.append(patch.reshape(B, 1, C * P)) 
+        return torch.cat(patches, dim=1)              
 
     def n_patches(self, seq_len: int) -> int:
         return (seq_len - self.patch_len) // self.stride + 1
@@ -160,10 +112,6 @@ class Unpatchify(nn.Module):
         return output / (count + 1e-8)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. PatchEmbedding
-# ─────────────────────────────────────────────────────────────────────────────
-
 class PatchEmbedding(nn.Module):
     def __init__(self, joint_dim: int, d_model: int,
                  max_patches: int = 256, dropout: float = 0.1):
@@ -180,7 +128,7 @@ class PatchEmbedding(nn.Module):
         )
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div[:d_model // 2])
-        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
+        self.register_buffer("pe", pe.unsqueeze(0))  
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, N, joint_dim) → (B, N, d_model)"""
@@ -188,10 +136,6 @@ class PatchEmbedding(nn.Module):
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Transformer Encoder Block
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TransformerEncoderBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1):
@@ -217,10 +161,6 @@ class TransformerEncoderBlock(nn.Module):
         return x
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. Голова реконструкции
-# ─────────────────────────────────────────────────────────────────────────────
-
 class ReconHead(nn.Module):
     def __init__(self, d_model: int, joint_dim: int, dropout: float = 0.1):
         super().__init__()
@@ -231,10 +171,6 @@ class ReconHead(nn.Module):
         """x: (B, N, d_model) → (B, N, joint_dim)"""
         return self.proj(self.drop(x))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Маскирование
-# ─────────────────────────────────────────────────────────────────────────────
 
 MaskType = Literal[
     "random",               # случайные патчи
@@ -317,35 +253,29 @@ def apply_mask_to_patches(
             masked = patches[b] * (1.0 - m.unsqueeze(-1))
 
         elif mask_type == "channel_wise":
-            # маскируем целые каналы: все патчи канала обнуляются
             assert n_channels is not None, "n_channels required for channel_wise"
             P           = CP // n_channels
             n_masked_ch = max(1, int(n_channels * mask_ratio))
-            masked      = patches[b].clone()                    # (N, C*P)
+            masked      = patches[b].clone()                    
             ch_order    = torch.randperm(n_channels, device=device)
             masked_chs  = ch_order[:n_masked_ch]
             for c in masked_chs.tolist():
-                masked[:, c * P:(c + 1) * P] = 0.0             # обнуляем канал
-            # patch-level маска: 1 везде, т.к. каждый патч содержит
-            # замаскированные каналы
+                masked[:, c * P:(c + 1) * P] = 0.0         
             m = (torch.ones(N, device=device) if n_masked_ch > 0
                  else torch.zeros(N, device=device))
 
         elif mask_type == "channel_independent":
-            # каждый канал маскируется своей независимой случайной маской
             assert n_channels is not None, "n_channels required for channel_independent"
             P        = CP // n_channels
-            masked   = patches[b].clone()                       # (N, C*P)
+            masked   = patches[b].clone()                      
             ch_masks = []
             for c in range(n_channels):
-                cm = (torch.rand(N, device=device) < mask_ratio).float()  # (N,)
+                cm = (torch.rand(N, device=device) < mask_ratio).float() 
                 masked[:, c * P:(c + 1) * P] *= (1.0 - cm.unsqueeze(-1))
                 ch_masks.append(cm)
-            # patch-level маска = 1, если хотя бы один канал замаскирован
-            m = torch.stack(ch_masks, dim=1).any(dim=1).float()  # (N,)
+            m = torch.stack(ch_masks, dim=1).any(dim=1).float()
 
         elif mask_type == "hybrid":
-            # сначала блок (ratio/2), потом случайные патчи (ratio/2) поверх
             m_block  = block_mask(N, mask_ratio * 0.5, device)
             m_random = random_mask(N, mask_ratio * 0.5, device)
             m        = torch.clamp(m_block + m_random, 0, 1)
@@ -361,14 +291,10 @@ def apply_mask_to_patches(
         all_masks.append(m)
         all_masked.append(masked)
 
-    mask           = torch.stack(all_masks,  dim=0)  # (B, N)
-    masked_patches = torch.stack(all_masked, dim=0)  # (B, N, C*P)
+    mask           = torch.stack(all_masks,  dim=0)
+    masked_patches = torch.stack(all_masked, dim=0)  
     return masked_patches, mask
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. Основная модель TimeRCD
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TimeRCD(nn.Module):
     """
@@ -445,13 +371,13 @@ class TimeRCD(nn.Module):
         x: (B, T, C)
         """
         x_norm, stats = self.revin(x, "norm")
-        patches       = self.patchify(x_norm)          # (B, N, C*P)
-        encoded       = self._encode(patches)           # (B, N, d_model)
-        recon_patches = self.head(encoded)              # (B, N, C*P)
-        recon_norm    = self.unpatchify(recon_patches)  # (B, T, C)
+        patches       = self.patchify(x_norm)       
+        encoded       = self._encode(patches)         
+        recon_patches = self.head(encoded)              
+        recon_norm    = self.unpatchify(recon_patches)  
         recon         = self.revin(recon_norm, "denorm", stats=stats)
 
-        anomaly_scores = torch.abs(x - recon).mean(dim=-1)  # (B, T)
+        anomaly_scores = torch.abs(x - recon).mean(dim=-1)  
         return RCDOutput(reconstruction=recon, anomaly_scores=anomaly_scores)
 
     def compute_loss(
@@ -472,14 +398,13 @@ class TimeRCD(nn.Module):
         B, T, C   = x.shape
 
         x_norm, _ = self.revin(x, "norm")
-        patches   = self.patchify(x_norm)               # (B, N, C*P)
+        patches   = self.patchify(x_norm)             
 
         if mask_ratio <= 0:
             encoded       = self._encode(patches)
             recon_patches = self.head(encoded)
             return F.mse_loss(recon_patches, patches)
 
-        # получаем маску (B, N) и строим masked_patches с mask_token
         _, mask = apply_mask_to_patches(
             patches, mask_ratio, mask_type, n_channels=C
         )
@@ -491,9 +416,9 @@ class TimeRCD(nn.Module):
         )
 
         encoded       = self._encode(masked_patches)
-        recon_patches = self.head(encoded)               # (B, N, C*P)
+        recon_patches = self.head(encoded)            
 
-        inv_mask     = mask.unsqueeze(-1)                # (B, N, 1)
+        inv_mask     = mask.unsqueeze(-1)              
         visible_mask = 1.0 - inv_mask
 
         n_patch_dim  = patches.shape[-1]
@@ -522,7 +447,7 @@ class TimeRCD(nn.Module):
         """
         B, T, C   = x.shape
         x_norm, _ = self.revin(x, "norm")
-        patches   = self.patchify(x_norm)               # (B, N, C*P)
+        patches   = self.patchify(x_norm)          
         N         = patches.shape[1]
 
         n_context = max(1, int((1.0 - mask_ratio) * N))
@@ -548,7 +473,6 @@ class TimeRCD(nn.Module):
         encoded       = self._encode(masked_patches)
         recon_patches = self.head(encoded)
 
-        # лосс только по query части
         query_mask = torch.zeros_like(mask)
         query_mask[:, n_context:] = 1.0
         inv_mask   = query_mask.unsqueeze(-1)
@@ -566,16 +490,14 @@ class TimeRCD(nn.Module):
         """
         B, T, C   = x.shape
         x_norm, stats = self.revin(x, "norm")
-        patches   = self.patchify(x_norm)               # (B, N, C*P)
+        patches   = self.patchify(x_norm)        
         N         = patches.shape[1]
 
-        # causal mask: патч i не видит патчи i+1..N-1
         causal_attn_mask = torch.triu(
             torch.ones(N, N, device=x.device), diagonal=1
-        ).bool()                                        # (N, N)
+        ).bool()                                       
 
-        # один forward pass с causal mask
-        emb = self.embed(patches)                       # (B, N, d_model)
+        emb = self.embed(patches)                   
         for block in self.encoder:
             attn_out, _ = block.self_attn(
                 emb, emb, emb, attn_mask=causal_attn_mask
@@ -583,12 +505,10 @@ class TimeRCD(nn.Module):
             emb = block.norm1(emb + block.drop(attn_out))
             emb = block.norm2(emb + block.drop(block.ff(emb)))
 
-        recon_patches = self.head(emb)                  # (B, N, C*P)
+        recon_patches = self.head(emb)                  
 
-        # ошибка для каждого патча
-        patch_errors = ((recon_patches - patches) ** 2).mean(dim=-1)  # (B, N)
+        patch_errors = ((recon_patches - patches) ** 2).mean(dim=-1)  
 
-        # патч-скоры → timestep скоры
         score_ts = torch.zeros(B, T, device=x.device)
         count_ts = torch.zeros(B, T, device=x.device)
         for i in range(N):
@@ -598,18 +518,12 @@ class TimeRCD(nn.Module):
             count_ts[:, start:end] += 1
         score_ts = score_ts / (count_ts + 1e-8)
 
-        # полная реконструкция для RMSE/MAE
         full_out = self.forward(x)
 
         return RCDOutput(
             reconstruction=full_out.reconstruction,
             anomaly_scores=score_ts,
         )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. Фабрика с пресетами
-# ─────────────────────────────────────────────────────────────────────────────
 
 def build_timercd(
     n_channels: int,
@@ -618,13 +532,6 @@ def build_timercd(
     mask_type:  MaskType                               = "random",
     device:     str                                    = "cpu",
 ) -> TimeRCD:
-    """
-    Фабрика с готовыми конфигурациями.
-
-    small  — быстрое обучение, для экспериментов
-    medium — баланс качества и скорости (рекомендуется)
-    large  — максимальное качество, медленнее
-    """
     configs = {
         "small":  dict(d_model=128, n_heads=4, n_layers=2,
                        d_ff=512,  patch_len=16, patch_stride=8),
@@ -640,32 +547,3 @@ def build_timercd(
         **configs[size],
     )
     return model.to(device)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Smoke-test
-# ─────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    B, T, C = 4, 512, 5
-    x = torch.randn(B, T, C)
-
-    for size in ["small", "medium"]:
-        print(f"\n{'='*60}")
-        print(f"Model size: {size}")
-        model   = build_timercd(n_channels=C, seq_len=T, size=size)
-        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"  Параметры: {n_params:,}")
-
-        with torch.no_grad():
-            out = model(x)
-        print(f"  reconstruction : {out.reconstruction.shape}")
-        print(f"  anomaly_scores : {out.anomaly_scores.shape}")
-
-        for mt in ["random", "block", "channel_wise",
-                   "channel_independent", "hybrid"]:
-            loss = model.compute_loss(x, mask_ratio=0.4, mask_type=mt)
-            print(f"  loss ({mt:<22}): {loss.item():.4f}")
-
-        loss_rcd = model.compute_loss_rcd(x, mask_ratio=0.2)
-        print(f"  loss (rcd)                    : {loss_rcd.item():.4f}")
